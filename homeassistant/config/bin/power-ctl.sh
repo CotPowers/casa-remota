@@ -1,5 +1,5 @@
 #!/bin/sh
-# Puente Home Assistant -> power-ctl del host por el tunel. GENERADO por setup-hub-vps.sh
+# Puente Home Assistant -> power-ctl del host por el tunel.
 # Uso: power-ctl.sh online | status-json | status | apagar
 H=powerctl@<ip-privada-8>
 O="-i /config/.ssh/power_ed25519 -o UserKnownHostsFile=/config/.ssh/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=5"
