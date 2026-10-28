@@ -12,7 +12,6 @@ services:
     networks:
       - red_proxy
 
-
 networks:
   red_proxy:
     driver: bridge
