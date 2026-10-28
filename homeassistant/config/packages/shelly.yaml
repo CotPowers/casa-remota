@@ -1,0 +1,133 @@
+# packages/shelly.yaml — GENERADO por /opt/homeassistant/setup-hub-vps.sh (no editar a mano: se regenera)
+# Enchufes Shelly Plug M Gen3 via la API de la nube de Shelly (el VPS no ve la red de casa).
+#   Servidor <ID Servidor Enchufe>: SOLO sensores. Sin interruptor para no apagarlo de golpe por error;
+#                          el corte de corriente sera un script protegido (paso 4).
+#   Termo    <ID Termo Enchufe>: interruptor normal + sensores.
+# Una sola peticion cada 30 s para los dos (limite de la API: 1 peticion/segundo).
+
+rest:
+  - resource: !secret shelly_get_url
+    method: POST
+    headers:
+      Content-Type: application/json
+    payload: '{"ids":["<ID Servidor Enchufe>","<ID Termo Enchufe>"],"select":["status"],"pick":{"status":["switch:0"]}}'
+    scan_interval: 30
+    timeout: 15
+    sensor:
+      - name: Servidor potencia
+        unique_id: shelly_servidor_potencia
+        device_class: power
+        state_class: measurement
+        unit_of_measurement: W
+        value_template: >-
+          {%- set d = value_json | selectattr('id', 'eq', '<ID Servidor Enchufe>') | list -%}
+          {{ d[0].status['switch:0'].apower if d and d[0].online else none }}
+      - name: Servidor energia
+        unique_id: shelly_servidor_energia
+        device_class: energy
+        state_class: total_increasing
+        unit_of_measurement: kWh
+        value_template: >-
+          {%- set d = value_json | selectattr('id', 'eq', '<ID Servidor Enchufe>') | list -%}
+          {{ (d[0].status['switch:0'].aenergy.total / 1000) | round(3) if d and d[0].online else none }}
+      - name: Servidor enchufe temperatura
+        unique_id: shelly_servidor_temperatura
+        device_class: temperature
+        state_class: measurement
+        unit_of_measurement: "°C"
+        value_template: >-
+          {%- set d = value_json | selectattr('id', 'eq', '<ID Servidor Enchufe>') | list -%}
+          {{ d[0].status['switch:0'].temperature.tC if d and d[0].online else none }}
+      - name: Termo potencia
+        unique_id: shelly_termo_potencia
+        device_class: power
+        state_class: measurement
+        unit_of_measurement: W
+        value_template: >-
+          {%- set d = value_json | selectattr('id', 'eq', '<ID Termo Enchufe>') | list -%}
+          {{ d[0].status['switch:0'].apower if d and d[0].online else none }}
+      - name: Termo energia
+        unique_id: shelly_termo_energia
+        device_class: energy
+        state_class: total_increasing
+        unit_of_measurement: kWh
+        value_template: >-
+          {%- set d = value_json | selectattr('id', 'eq', '<ID Termo Enchufe>') | list -%}
+          {{ (d[0].status['switch:0'].aenergy.total / 1000) | round(3) if d and d[0].online else none }}
+      - name: Termo enchufe temperatura
+        unique_id: shelly_termo_temperatura
+        device_class: temperature
+        state_class: measurement
+        unit_of_measurement: "°C"
+        value_template: >-
+          {%- set d = value_json | selectattr('id', 'eq', '<ID Termo Enchufe>') | list -%}
+          {{ d[0].status['switch:0'].temperature.tC if d and d[0].online else none }}
+    binary_sensor:
+      - name: Servidor enchufe en linea
+        unique_id: shelly_servidor_online
+        device_class: connectivity
+        value_template: "{{ value_json | selectattr('id', 'eq', '<ID Servidor Enchufe>') | selectattr('online') | list | count > 0 }}"
+      - name: Servidor enchufe salida
+        unique_id: shelly_servidor_salida
+        device_class: power
+        value_template: >-
+          {%- set d = value_json | selectattr('id', 'eq', '<ID Servidor Enchufe>') | list -%}
+          {{ d[0].status['switch:0'].output if d and d[0].online else none }}
+      - name: Termo enchufe en linea
+        unique_id: shelly_termo_online
+        device_class: connectivity
+        value_template: "{{ value_json | selectattr('id', 'eq', '<ID Termo Enchufe>') | selectattr('online') | list | count > 0 }}"
+      - name: Termo salida
+        unique_id: shelly_termo_salida
+        device_class: power
+        value_template: >-
+          {%- set d = value_json | selectattr('id', 'eq', '<ID Termo Enchufe>') | list -%}
+          {{ d[0].status['switch:0'].output if d and d[0].online else none }}
+
+# Energia del dia (se reinicia a medianoche); la usa /consumo.
+utility_meter:
+  servidor_energia_hoy:
+    name: Servidor energia hoy
+    source: sensor.servidor_energia
+    cycle: daily
+  termo_energia_hoy:
+    name: Termo energia hoy
+    source: sensor.termo_energia
+    cycle: daily
+
+# Orden a un enchufe. Variables: id, encender (true/false), toggle_after (segundos, opcional:
+# pasado ese tiempo el propio enchufe vuelve al estado contrario, aunque se pierda la conexion).
+rest_command:
+  shelly_set:
+    url: !secret shelly_set_url
+    method: POST
+    content_type: application/json
+    timeout: 15
+    payload: >-
+      {"id":"{{ id }}","channel":0,"on":{{ 'true' if encender else 'false' }}{% if toggle_after is defined %},"toggle_after":{{ toggle_after | int }}{% endif %}}
+
+template:
+  - switch:
+      - name: Termo
+        unique_id: shelly_termo_switch
+        icon: mdi:water-boiler
+        state: "{{ is_state('binary_sensor.termo_salida', 'on') }}"
+        availability: "{{ has_value('binary_sensor.termo_salida') }}"
+        turn_on:
+          - action: rest_command.shelly_set
+            data:
+              id: "<ID Termo Enchufe>"
+              encender: true
+          - delay: 3
+          - action: homeassistant.update_entity
+            target:
+              entity_id: sensor.termo_potencia
+        turn_off:
+          - action: rest_command.shelly_set
+            data:
+              id: "<ID Termo Enchufe>"
+              encender: false
+          - delay: 3
+          - action: homeassistant.update_entity
+            target:
+              entity_id: sensor.termo_potencia

@@ -1,0 +1,4 @@
+
+<dominio-1> {
+    reverse_proxy homeassistant:8123
+}

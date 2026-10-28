@@ -1,0 +1,325 @@
+# packages/telegram.yaml — GENERADO por /opt/homeassistant/setup-hub-vps.sh (no editar a mano: se regenera)
+# Bot @<bot-telegram>: integracion "Telegram bot" configurada en la IU (modo sondeo, chat permitido <Chat ID Telegram>).
+# Comandos: /aspirar /base /aspirar_auto /estado /encender /termo /termo_on /termo_off /termo_auto /apagar /consumo /ayuda (/start)
+# Botones:  /apagar_si /apagar_no (pregunta de /apagar) · /cortar_corriente (avisos)
+
+script:
+  # Unico punto de salida de avisos: Telegram (con botones opcionales) + notificacion en HA como respaldo.
+  # botones: lista de {texto, accion}; accion = dato del boton (p. ej. /cortar_corriente).
+  aviso:
+    alias: Aviso
+    mode: queued
+    fields:
+      titulo:
+        selector: {text: null}
+      mensaje:
+        selector: {text: {multiline: true}}
+      botones:
+        selector: {object: null}
+    sequence:
+      - action: persistent_notification.create
+        data:
+          title: "{{ titulo }}"
+          message: "{{ mensaje }}"
+      - variables:
+          teclado: >-
+            {%- set ns = namespace(l=[]) -%}
+            {%- for b in (botones | default([], true)) -%}
+              {%- set ns.l = ns.l + [b.texto ~ ':' ~ b.accion] -%}
+            {%- endfor -%}
+            {{ ns.l | join(', ') }}
+      - if: "{{ teclado | length > 0 }}"
+        then:
+          - action: telegram_bot.send_message
+            continue_on_error: true
+            data:
+              chat_id: <Chat ID Telegram>
+              parse_mode: html
+              message: "<b>{{ titulo }}</b>\n{{ mensaje }}"
+              inline_keyboard: ["{{ teclado }}"]
+        else:
+          - action: telegram_bot.send_message
+            continue_on_error: true
+            data:
+              chat_id: <Chat ID Telegram>
+              parse_mode: html
+              message: "<b>{{ titulo }}</b>\n{{ mensaje }}"
+
+  telegram_responder:
+    alias: Telegram - responder
+    mode: parallel
+    fields:
+      mensaje:
+        selector: {text: {multiline: true}}
+    sequence:
+      - action: telegram_bot.send_message
+        data:
+          chat_id: <Chat ID Telegram>
+          parse_mode: html
+          message: "{{ mensaje }}"
+
+  telegram_estado:
+    alias: Telegram - /estado
+    mode: single
+    sequence:
+      - action: homeassistant.update_entity
+        target: {entity_id: binary_sensor.servidor_en_linea}
+      - if: "{{ is_state('binary_sensor.servidor_en_linea', 'on') }}"
+        then:
+          - action: script.servidor_actualizar_estado
+      - action: script.telegram_responder
+        data:
+          mensaje: >-
+            {%- set dias = ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo'] -%}
+            {%- set ns = namespace(l=[]) -%}
+            {%- set w = states('sensor.servidor_potencia') -%}
+            {%- if is_state('binary_sensor.servidor_en_linea', 'on') -%}
+              {%- set ns.l = ns.l + ['<b>📊 Servidor encendido</b>'] -%}
+              {%- if is_state('sensor.servidor_estado', 'ok') -%}
+                {%- set p = state_attr('sensor.servidor_estado', 'playing') | int(-1) -%}
+                {%- set z = state_attr('sensor.servidor_estado', 'paused') | int(-1) -%}
+                {%- set jf = (state_attr('sensor.servidor_estado', 'jellyfin') ~ '/?').split('/') -%}
+                {%- set px = (state_attr('sensor.servidor_estado', 'plex') ~ '/?').split('/') -%}
+                {%- if p < 0 -%}
+                  {%- set ns.l = ns.l + ['⚠️ No se pudo consultar Jellyfin/Plex'] -%}
+                {%- else -%}
+                  {%- set ns.l = ns.l + ['▶️ Reproduciendo: ' ~ p ~ ' (Jellyfin ' ~ jf[0] ~ ' · Plex ' ~ px[0] ~ ')'] -%}
+                  {%- set pa = '⏸ En pausa: ' ~ z ~ ' (Jellyfin ' ~ jf[1] ~ ' · Plex ' ~ px[1] ~ ')' -%}
+                  {%- if z > 0 -%}{%- set pa = pa ~ ', la más reciente hace ' ~ state_attr('sensor.servidor_estado', 'paused_min') ~ ' min' -%}{%- endif -%}
+                  {%- set ns.l = ns.l + [pa] -%}
+                {%- endif -%}
+                {%- set up = (state_attr('sensor.servidor_estado', 'up') | string).replace('_', ' ').replace('up ', '').replace('weeks', 'sem').replace('week', 'sem').replace('days', 'd').replace('day', 'd').replace('hours', 'h').replace('hour', 'h').replace('minutes', 'min').replace('minute', 'min') -%}
+                {%- set ns.l = ns.l + ['⏱ Encendido hace ' ~ up] -%}
+              {%- else -%}
+                {%- set ns.l = ns.l + ['⚠️ Responde, pero no pude leer su estado.'] -%}
+              {%- endif -%}
+            {%- else -%}
+              {%- set ns.l = ns.l + ['<b>🔴 Servidor apagado</b>'] -%}
+              {%- set ns.l = ns.l + ['Para encenderlo: /encender (o el botón del servidor).'] -%}
+            {%- endif -%}
+            {%- set ns.l = ns.l + ['🔌 Enchufe: ' ~ (w ~ ' W' if is_number(w) else 'sin lectura')] -%}
+            {{ ns.l | join('\n') }}
+
+  telegram_apagar:
+    alias: Telegram - /apagar
+    mode: single
+    sequence:
+      - action: homeassistant.update_entity
+        target: {entity_id: binary_sensor.servidor_en_linea}
+      - if: "{{ is_state('binary_sensor.servidor_en_linea', 'off') }}"
+        then:
+          - action: script.telegram_responder
+            data: {mensaje: "🔴 El servidor ya está apagado."}
+          - stop: Ya apagado
+      - action: script.servidor_actualizar_estado
+      - variables:
+          ok: "{{ is_state('sensor.servidor_estado', 'ok') }}"
+          playing: "{{ state_attr('sensor.servidor_estado', 'playing') | int(-1) }}"
+          paused: "{{ state_attr('sensor.servidor_estado', 'paused') | int(-1) }}"
+          pmin: "{{ state_attr('sensor.servidor_estado', 'paused_min') | int(-1) }}"
+          motivo: >-
+            {%- if not ok or playing < 0 or paused < 0 -%}No he podido comprobar si hay algo reproduciéndose en Jellyfin/Plex.
+            {%- elif playing > 0 -%}Hay {{ playing }} reproducción(es) en marcha.
+            {%- elif paused > 0 and pmin < 30 -%}Hay {{ paused }} reproducción(es) en pausa desde hace {{ pmin }} min (menos de 30).
+            {%- endif -%}
+      - if: "{{ motivo | length > 0 }}"
+        then:
+          - action: telegram_bot.send_message
+            data:
+              chat_id: <Chat ID Telegram>
+              parse_mode: html
+              message: "⚠️ {{ motivo }}\n¿Apago el servidor igualmente?"
+              inline_keyboard: ["Apagar:/apagar_si, No apagar:/apagar_no"]
+            response_variable: q
+          - wait_for_trigger:
+              - trigger: event
+                event_type: telegram_callback
+                event_data: {chat_id: <Chat ID Telegram>, data: /apagar_si}
+              - trigger: event
+                event_type: telegram_callback
+                event_data: {chat_id: <Chat ID Telegram>, data: /apagar_no}
+            timeout: "00:15:00"
+            continue_on_timeout: true
+          - variables:
+              resp: "{{ wait.trigger.event.data.data if wait.trigger else 'caducada' }}"
+              mid: "{{ q.chats[0].message_id }}"
+          - if: "{{ wait.trigger is not none }}"
+            then:
+              - action: telegram_bot.answer_callback_query
+                continue_on_error: true
+                data:
+                  callback_query_id: "{{ wait.trigger.event.data.id }}"
+                  message: "{{ 'Apagando…' if resp == '/apagar_si' else 'Cancelado' }}"
+          - if: "{{ resp != '/apagar_si' }}"
+            then:
+              - action: telegram_bot.edit_message
+                continue_on_error: true
+                data:
+                  chat_id: <Chat ID Telegram>
+                  message_id: "{{ mid }}"
+                  parse_mode: html
+                  message: "⚠️ {{ motivo }}\n🚫 Cancelado{{ ' (15 min sin respuesta)' if resp == 'caducada' else '' }}. El servidor sigue encendido."
+              - stop: Cancelado
+          - action: telegram_bot.edit_message
+            continue_on_error: true
+            data:
+              chat_id: <Chat ID Telegram>
+              message_id: "{{ mid }}"
+              parse_mode: html
+              message: "⚠️ {{ motivo }}\n✅ Confirmado."
+      - action: script.servidor_apagar
+        response_variable: r
+      - action: script.telegram_responder
+        data:
+          mensaje: >-
+            {%- if r.estado == 'apagando' -%}
+              {{ '🔌 Apagando en unos segundos.\nPara encenderlo: /encender (o el botón del servidor).' }}
+            {%- else -%}
+              {{ '❌ No se ha apagado: ' ~ (r.salida | default('sin respuesta') | replace('<', '‹') | replace('>', '›')) }}
+            {%- endif -%}
+
+  telegram_encender:
+    alias: Telegram - /encender
+    mode: single
+    sequence:
+      - action: homeassistant.update_entity
+        target: {entity_id: [binary_sensor.servidor_en_linea, sensor.servidor_potencia]}
+      - choose:
+          - conditions: "{{ is_state('binary_sensor.servidor_en_linea', 'on') }}"
+            sequence:
+              - action: script.telegram_responder
+                data: {mensaje: "✅ El servidor ya está encendido."}
+          - conditions: "{{ states('sensor.servidor_potencia') | float(0) > 30 }}"
+            sequence:
+              - action: script.aviso
+                data:
+                  titulo: "⚠️ Servidor sin respuesta"
+                  mensaje: "Consume {{ states('sensor.servidor_potencia') | float(0) | round(0) | int }} W pero no responde (arrancando o colgado). ¿Corto la corriente 5 min?"
+                  botones:
+                    - {texto: "Cortar corriente 5 min", accion: "/cortar_corriente"}
+        default:
+          - action: script.servidor_cortar_corriente
+            response_variable: r
+          - action: script.telegram_responder
+            data:
+              mensaje: "{% if r.estado == 'cortado' %}🔌 Corriente cortada 5 min: al volver arrancará solo. Listo en unos 7 min; te aviso.{% elif r.estado == 'responde' %}✅ El servidor ya responde.{% else %}❌ No pude hablar con el enchufe.{% endif %}"
+
+  telegram_termo:
+    alias: Telegram - /termo
+    mode: single
+    fields:
+      accion:
+        selector: {text: null}
+    sequence:
+      - choose:
+          - conditions: "{{ accion == 'on' }}"
+            sequence:
+              - action: script.termo_encender
+                data: {minutos: 120, motivo: "manual"}
+          - conditions: "{{ accion == 'off' }}"
+            sequence:
+              - action: script.termo_apagar
+                data: {motivo: "manual"}
+          - conditions: "{{ accion == 'auto' }}"
+            sequence:
+              - action: input_boolean.toggle
+                target: {entity_id: input_boolean.termo_programado}
+      - delay: 4
+      - action: script.telegram_responder
+        data:
+          mensaje: >-
+            {{ '<b>🚿 Termo</b>: ' ~ ('encendido' if is_state('switch.termo', 'on') else 'apagado') ~ ' · ' ~ states('sensor.termo_potencia') ~ ' W\nProgramación (6:30–8:00 y 21:00–23:00): ' ~ ('activa' if is_state('input_boolean.termo_programado', 'on') else 'PAUSADA') }}
+
+  telegram_consumo:
+    alias: Telegram - /consumo
+    sequence:
+      - action: homeassistant.update_entity
+        target: {entity_id: sensor.servidor_potencia}
+      - action: script.telegram_responder
+        data:
+          mensaje: >-
+            {%- set sp = states('sensor.servidor_potencia') -%}{%- set sh = states('sensor.servidor_energia_hoy') -%}
+            {%- set tp = states('sensor.termo_potencia') -%}{%- set th = states('sensor.termo_energia_hoy') -%}
+            {%- set sp = (sp | float | round(1) ~ ' W') if is_number(sp) else 'sin lectura' -%}
+            {%- set sh = (sh | float | round(2) ~ ' kWh') if is_number(sh) else 'sin lectura' -%}
+            {%- set tp = (tp | float | round(1) ~ ' W') if is_number(tp) else 'sin lectura' -%}
+            {%- set th = (th | float | round(2) ~ ' kWh') if is_number(th) else 'sin lectura' -%}
+            {{ '<b>⚡ Consumo</b>\n🖥 Servidor: ' ~ sp ~ ' · hoy ' ~ sh ~ '\n🚿 Termo (' ~ ('encendido' if is_state('switch.termo', 'on') else 'apagado') ~ '): ' ~ tp ~ ' · hoy ' ~ th }}
+
+automation:
+  - id: telegram_comandos
+    alias: Telegram - comandos
+    mode: parallel
+    max: 5
+    triggers:
+      - trigger: event
+        event_type: telegram_command
+        event_data: {chat_id: <Chat ID Telegram>}
+    actions:
+      - variables:
+          cmd: "{{ (trigger.event.data.command | default('') | lower).split('@')[0] }}"
+      - choose:
+          - conditions: "{{ cmd == '/estado' }}"
+            sequence: [{action: script.telegram_estado}]
+          - conditions: "{{ cmd == '/apagar' }}"
+            sequence: [{action: script.turn_on, target: {entity_id: script.telegram_apagar}}]
+          - conditions: "{{ cmd == '/consumo' }}"
+            sequence: [{action: script.telegram_consumo}]
+          - conditions: "{{ cmd == '/aspirar' }}"
+            sequence: [{action: script.telegram_aspirar}]
+          - conditions: "{{ cmd == '/base' }}"
+            sequence: [{action: script.telegram_aspiradora_base}]
+          - conditions: "{{ cmd == '/aspirar_auto' }}"
+            sequence: [{action: script.telegram_aspiradora_auto}]
+          - conditions: "{{ cmd == '/encender' }}"
+            sequence: [{action: script.turn_on, target: {entity_id: script.telegram_encender}}]
+          - conditions: "{{ cmd in ['/termo', '/termo_on', '/termo_off', '/termo_auto'] }}"
+            sequence:
+              - action: script.telegram_termo
+                data: {accion: "{{ cmd[7:] if cmd | length > 6 else '' }}"}
+        default:
+          - action: script.telegram_responder
+            data:
+              mensaje: "<b>🤖 Control de casa</b>\n/estado – estado del servidor\n/encender – enciende el servidor (si no responde)\n/apagar – apaga ya (pregunta si hay algo reproduciéndose)\n/consumo – consumo del servidor y del termo\n/termo – estado del termo · /termo_on /termo_off · /termo_auto pausa o reanuda la programación\n/aspirar – Coro empieza a barrer · /base la manda a la base · /aspirar_auto pausa o reanuda su programación\n/ayuda – esta lista"
+
+  - id: telegram_botones
+    alias: Telegram - botones de los avisos
+    mode: queued
+    triggers:
+      - trigger: event
+        event_type: telegram_callback
+        event_data: {chat_id: <Chat ID Telegram>}
+    actions:
+      - variables:
+          d: "{{ trigger.event.data.data }}"
+          cid: "{{ trigger.event.data.id }}"
+          mid: "{{ trigger.event.data.message.message_id }}"
+          txt: "{{ trigger.event.data.message.text | default('') }}"
+      - choose:
+          - conditions: "{{ d == '/cortar_corriente' }}"
+            sequence:
+              - action: telegram_bot.answer_callback_query
+                continue_on_error: true
+                data: {callback_query_id: "{{ cid }}", message: "Comprobando…"}
+              - action: script.servidor_cortar_corriente
+                response_variable: r
+              - action: telegram_bot.edit_message
+                continue_on_error: true
+                data:
+                  chat_id: <Chat ID Telegram>
+                  message_id: "{{ mid }}"
+                  parse_mode: plain_text
+                  message: "{{ txt }}\n\n{% if r.estado == 'cortado' %}🔌 Corriente cortada: vuelve sola en 5 min y el servidor debería arrancar.{% elif r.estado == 'responde' %}✅ El servidor responde: no corto la corriente.{% else %}❌ No pude hablar con el enchufe.{% endif %}"
+          # Boton de una pregunta de /apagar que ya no esta esperando respuesta
+          - conditions: "{{ d in ['/apagar_si', '/apagar_no'] and is_state('script.telegram_apagar', 'off') }}"
+            sequence:
+              - action: telegram_bot.answer_callback_query
+                continue_on_error: true
+                data: {callback_query_id: "{{ cid }}", message: "Esta pregunta ya caducó"}
+              - action: telegram_bot.edit_message
+                continue_on_error: true
+                data:
+                  chat_id: <Chat ID Telegram>
+                  message_id: "{{ mid }}"
+                  parse_mode: plain_text
+                  message: "{{ txt }}\n\n⌛ Pregunta caducada."

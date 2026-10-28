@@ -1,0 +1,170 @@
+# Termo: 6:30-8:00 y 21:00-23:00. El encendido lleva toggle_after: el propio enchufe se apaga
+# aunque HA o la conexion fallen; HA ademas da la orden de apagado a la hora (respaldo) y avisa.
+input_boolean:
+  termo_programado:
+    name: Termo programado
+    icon: mdi:calendar-clock
+    initial: true
+  termo_en_ciclo:
+    name: Termo en ciclo automatico
+    icon: mdi:water-boiler-auto
+
+input_datetime:
+  termo_ultima_orden:
+    name: Termo ultima orden de HA
+    has_date: true
+    has_time: true
+
+script:
+  termo_encender:
+    alias: Termo - encender
+    mode: single
+    fields:
+      minutos:
+        description: Minutos hasta el apagado automatico del enchufe
+        default: 90
+        selector: {number: {min: 5, max: 240}}
+      motivo:
+        selector: {text: null}
+    sequence:
+      - action: input_datetime.set_datetime
+        target: {entity_id: input_datetime.termo_ultima_orden}
+        data: {timestamp: "{{ now().timestamp() | int }}"}
+      - variables:
+          r1: {status: 0}
+          r2: {status: 0}
+      - action: rest_command.shelly_set
+        continue_on_error: true
+        data:
+          id: "<ID Termo Enchufe>"
+          encender: true
+          toggle_after: "{{ ((minutos | default(90) | int) * 60) }}"
+        response_variable: r1
+      # La nube de Shelly admite 1 peticion/s: si choca con la consulta periodica, se reintenta una vez.
+      - if: "{{ (r1.status | default(0)) != 200 }}"
+        then:
+          - delay: 5
+          - action: rest_command.shelly_set
+            continue_on_error: true
+            data:
+              id: "<ID Termo Enchufe>"
+              encender: true
+              toggle_after: "{{ ((minutos | default(90) | int) * 60) }}"
+            response_variable: r2
+      - variables:
+          ok: "{{ (r1.status | default(0)) == 200 or (r2.status | default(0)) == 200 }}"
+      # El aviso va ANTES de cualquier refresco para que nada lo bloquee.
+      - if: "{{ ok }}"
+        then:
+          - action: input_boolean.turn_on
+            target: {entity_id: input_boolean.termo_en_ciclo}
+          - action: script.aviso
+            data:
+              titulo: "🚿 Termo encendido"
+              mensaje: "{{ motivo | default('') }} · se apaga solo en {{ minutos | default(90) | int }} min."
+        else:
+          - action: script.aviso
+            data:
+              titulo: "❌ Termo: no pude encenderlo"
+              mensaje: "La nube de Shelly no respondió (dos intentos). Prueba /termo_on."
+      - delay: 8
+      - action: homeassistant.update_entity
+        continue_on_error: true
+        target: {entity_id: sensor.termo_potencia}
+
+  termo_apagar:
+    alias: Termo - apagar
+    mode: single
+    fields:
+      motivo:
+        selector: {text: null}
+    sequence:
+      - action: input_datetime.set_datetime
+        target: {entity_id: input_datetime.termo_ultima_orden}
+        data: {timestamp: "{{ now().timestamp() | int }}"}
+      - variables:
+          r1: {status: 0}
+          r2: {status: 0}
+      - action: rest_command.shelly_set
+        continue_on_error: true
+        data:
+          id: "<ID Termo Enchufe>"
+          encender: false
+        response_variable: r1
+      - if: "{{ (r1.status | default(0)) != 200 }}"
+        then:
+          - delay: 5
+          - action: rest_command.shelly_set
+            continue_on_error: true
+            data:
+              id: "<ID Termo Enchufe>"
+              encender: false
+            response_variable: r2
+      - variables:
+          ok: "{{ (r1.status | default(0)) == 200 or (r2.status | default(0)) == 200 }}"
+      - action: input_boolean.turn_off
+        target: {entity_id: input_boolean.termo_en_ciclo}
+      - action: script.aviso
+        data:
+          titulo: "{{ '🚿 Termo apagado' if ok else '❌ Termo: no pude apagarlo' }}"
+          mensaje: "{{ motivo | default('') }}{{ '' if ok else ' · el enchufe se apagará solo por su temporizador.' }}"
+      - delay: 8
+      - action: homeassistant.update_entity
+        continue_on_error: true
+        target: {entity_id: sensor.termo_potencia}
+
+automation:
+  # Aviso cuando el termo cambia sin que HA lo haya ordenado (interruptor de HA, boton del enchufe,
+  # app Shelly o el temporizador del propio enchufe). El estado se lee cada 30 s, asi que el aviso tarda <= 30 s.
+  - id: termo_cambio_externo
+    alias: Termo - aviso de cambio no ordenado por scripts
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.termo_salida
+    conditions:
+      - "{{ trigger.from_state.state in ['on', 'off'] and trigger.to_state.state in ['on', 'off'] and trigger.from_state.state != trigger.to_state.state }}"
+      - "{{ (now().timestamp() - (states('input_datetime.termo_ultima_orden') | as_timestamp(0))) > 120 }}"
+    actions:
+      - if: "{{ trigger.to_state.state == 'off' }}"
+        then:
+          - action: input_boolean.turn_off
+            target: {entity_id: input_boolean.termo_en_ciclo}
+          - action: script.aviso
+            data:
+              titulo: "🚿 Termo apagado"
+              mensaje: "Se ha apagado por el temporizador del enchufe, el botón o la app (no por una orden de HA)."
+        else:
+          - action: script.aviso
+            data:
+              titulo: "🚿 Termo encendido"
+              mensaje: "Encendido fuera de la programación: interruptor de HA, botón del enchufe o app Shelly. Si fue desde HA o la app, recuerda apagarlo con /termo_off."
+
+  - id: termo_manana_on
+    alias: Termo - encender 6:30
+    triggers: [{trigger: time, at: "06:30:15"}]
+    conditions: "{{ is_state('input_boolean.termo_programado', 'on') }}"
+    actions:
+      - action: script.termo_encender
+        data: {minutos: 90, motivo: "franja de la mañana (6:30–8:00)"}
+  - id: termo_manana_off
+    alias: Termo - apagar 8:00
+    triggers: [{trigger: time, at: "08:00:15"}]
+    conditions: "{{ is_state('input_boolean.termo_en_ciclo', 'on') }}"
+    actions:
+      - action: script.termo_apagar
+        data: {motivo: "fin de la franja de la mañana"}
+  - id: termo_noche_on
+    alias: Termo - encender 21:00
+    triggers: [{trigger: time, at: "21:00:15"}]
+    conditions: "{{ is_state('input_boolean.termo_programado', 'on') }}"
+    actions:
+      - action: script.termo_encender
+        data: {minutos: 120, motivo: "franja de la noche (21:00–23:00)"}
+  - id: termo_noche_off
+    alias: Termo - apagar 23:00
+    triggers: [{trigger: time, at: "23:00:15"}]
+    conditions: "{{ is_state('input_boolean.termo_en_ciclo', 'on') }}"
+    actions:
+      - action: script.termo_apagar
+        data: {motivo: "fin de la franja de la noche"}

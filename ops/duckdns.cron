@@ -1,0 +1,2 @@
+# Actualiza la IP de los subdominios de DuckDNS cada 30 min. Token en <fichero-token> (solo root).
+*/30 * * * * root curl -fsS "https://www.duckdns.org/update?domains=<subdominio-1>,<subdominio-2>&token=$(cat <fichero-token>)&ip=" >/dev/null 2>&1

@@ -1,0 +1,169 @@
+# Coro (Xiaomi X20+): barre una vez al dia cuando los dos moviles llevan 10 min fuera de casa.
+# Si alguien vuelve durante ese ciclo automatico, la manda a la base y avisa.
+input_boolean:
+  aspiradora_programada:
+    name: Aspiradora programada
+    icon: mdi:robot-vacuum
+    initial: true
+  aspiradora_ciclo_auto:
+    name: Aspiradora en ciclo automatico
+    icon: mdi:robot-vacuum-variant
+
+input_datetime:
+  aspiradora_ultimo_barrido:
+    name: Aspiradora ultimo barrido
+    has_date: true
+    has_time: false
+
+template:
+  - binary_sensor:
+      # Casa vacia = hay al menos 2 rastreadores GPS (los dos moviles), todos con estado conocido y ninguno en casa.
+      - name: Casa vacia
+        unique_id: casa_vacia
+        icon: mdi:home-off
+        state: >-
+          {%- set t = states.device_tracker | selectattr('attributes.source_type', 'defined') | selectattr('attributes.source_type', 'eq', 'gps') | list -%}
+          {%- set raros = t | rejectattr('state', 'in', ['home', 'not_home']) | list -%}
+          {%- set en_casa = t | selectattr('state', 'eq', 'home') | list -%}
+          {{ (t | length) >= 2 and (raros | length) == 0 and (en_casa | length) == 0 }}
+        attributes:
+          moviles: >-
+            {%- set t = states.device_tracker | selectattr('attributes.source_type', 'defined') | selectattr('attributes.source_type', 'eq', 'gps') | list -%}
+            {%- set ns = namespace(l=[]) -%}
+            {%- for x in t -%}{%- set ns.l = ns.l + [x.entity_id ~ '=' ~ x.state] -%}{%- endfor -%}
+            {{ ns.l | join(', ') }}
+
+script:
+  aspiradora_iniciar:
+    alias: Aspiradora - iniciar
+    mode: single
+    fields:
+      auto:
+        description: Ciclo automatico (se interrumpe si alguien vuelve)
+        default: false
+        selector: {boolean: null}
+    sequence:
+      - action: input_boolean.turn_on
+        target: {entity_id: input_boolean.aspiradora_ciclo_auto}
+      - action: input_datetime.set_datetime
+        target: {entity_id: input_datetime.aspiradora_ultimo_barrido}
+        data: {date: "{{ now().date().isoformat() }}"}
+      - action: vacuum.start
+        target: {entity_id: vacuum.xiaomi}
+      - action: script.aviso
+        data:
+          titulo: "🤖 Coro empieza a barrer"
+          mensaje: "{{ 'Casa vacia desde hace 10 min: ciclo automatico.' if auto else 'Orden manual.' }}"
+
+  telegram_aspirar:
+    alias: Telegram - /aspirar
+    mode: single
+    sequence:
+      - variables:
+          e: "{{ states('vacuum.xiaomi') }}"
+      - choose:
+          - conditions: "{{ e in ['cleaning', 'returning'] }}"
+            sequence:
+              - action: script.telegram_responder
+                data: {mensaje: "🤖 Coro ya está en marcha ({{ e }})."}
+          - conditions: "{{ e in ['docked', 'idle', 'paused'] }}"
+            sequence:
+              - action: script.aspiradora_iniciar
+                data: {auto: false}
+        default:
+          - action: script.telegram_responder
+            data: {mensaje: "❌ Coro no está disponible (estado: {{ e }})."}
+
+  telegram_aspiradora_base:
+    alias: Telegram - /base
+    mode: single
+    sequence:
+      - action: vacuum.return_to_base
+        target: {entity_id: vacuum.xiaomi}
+      - action: input_boolean.turn_off
+        target: {entity_id: input_boolean.aspiradora_ciclo_auto}
+      - action: script.telegram_responder
+        data: {mensaje: "🏠 Coro vuelve a la base."}
+
+  telegram_aspiradora_auto:
+    alias: Telegram - /aspirar_auto
+    mode: single
+    sequence:
+      - action: input_boolean.toggle
+        target: {entity_id: input_boolean.aspiradora_programada}
+      - action: script.telegram_responder
+        data:
+          mensaje: >-
+            {{ '<b>🤖 Coro</b>: ' ~ states('vacuum.xiaomi') ~ '\nProgramación: ' ~ ('activa' if is_state('input_boolean.aspiradora_programada', 'on') else 'PAUSADA') ~ '\nÚltimo barrido: ' ~ states('input_datetime.aspiradora_ultimo_barrido') ~ '\nCasa vacía: ' ~ ('sí' if is_state('binary_sensor.casa_vacia', 'on') else 'no') ~ ' (' ~ state_attr('binary_sensor.casa_vacia', 'moviles') ~ ')' }}
+
+automation:
+  - id: aspiradora_automatica
+    alias: Aspiradora - barrer con la casa vacia
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.casa_vacia
+        to: "on"
+        for: "00:10:00"
+      - trigger: time
+        at: "09:00:00"
+    conditions:
+      - "{{ is_state('input_boolean.aspiradora_programada', 'on') }}"
+      - "{{ is_state('binary_sensor.casa_vacia', 'on') }}"
+      - "{{ (now() - states.binary_sensor.casa_vacia.last_changed).total_seconds() >= 600 }}"
+      - "{{ 9 <= now().hour < 20 }}"
+      - "{{ states('input_datetime.aspiradora_ultimo_barrido') != now().date().isoformat() }}"
+      - "{{ states('vacuum.xiaomi') in ['docked', 'idle'] }}"
+    actions:
+      - action: script.aspiradora_iniciar
+        data: {auto: true}
+
+  - id: aspiradora_alguien_vuelve
+    alias: Aspiradora - alguien vuelve, termina el ciclo
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.casa_vacia
+        from: "on"
+        to: "off"
+    conditions:
+      - "{{ is_state('input_boolean.aspiradora_ciclo_auto', 'on') }}"
+      - "{{ is_state('vacuum.xiaomi', 'cleaning') }}"
+    actions:
+      - action: vacuum.return_to_base
+        target: {entity_id: vacuum.xiaomi}
+      - action: script.aviso
+        data:
+          titulo: "🏠 Alguien ha vuelto"
+          mensaje: "Coro interrumpe el ciclo y vuelve a la base. Hoy ya no volverá a barrer."
+
+  - id: aspiradora_fin
+    alias: Aspiradora - ciclo terminado
+    mode: queued
+    triggers:
+      - trigger: state
+        entity_id: vacuum.xiaomi
+        from: ["cleaning", "returning"]
+        to: "docked"
+    actions:
+      - if: "{{ is_state('input_boolean.aspiradora_ciclo_auto', 'on') }}"
+        then:
+          - action: script.aviso
+            data:
+              titulo: "✅ Coro ha terminado"
+              mensaje: "Está en la base."
+      - action: input_boolean.turn_off
+        target: {entity_id: input_boolean.aspiradora_ciclo_auto}
+
+  - id: aspiradora_error
+    alias: Aspiradora - error
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: vacuum.xiaomi
+        to: "error"
+    actions:
+      - action: script.aviso
+        data:
+          titulo: "❌ Coro tiene un error"
+          mensaje: "Se ha atascado o necesita atención. Revisa la app Xiaomi Home."

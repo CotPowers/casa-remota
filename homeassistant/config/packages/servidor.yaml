@@ -1,0 +1,208 @@
+# packages/servidor.yaml — GENERADO por /opt/homeassistant/setup-hub-vps.sh (no editar a mano: se regenera)
+# Servidor Proxmox controlado por SSH (clave restringida a power-ctl) a traves del tunel WireGuard.
+# El host es pasivo: HA recuerda sus propias ordenes (apagado esperado y hora de encendido) y
+# detecta arranques y caidas con "Servidor en linea".
+
+input_boolean:
+  servidor_apagado_esperado:
+    name: Servidor apagado esperado
+    icon: mdi:power-sleep
+
+input_datetime:
+  servidor_proximo_encendido:
+    name: Servidor proximo encendido
+    has_date: true
+    has_time: true
+
+shell_command:
+  power_ctl: "/config/bin/power-ctl.sh {{ orden }}"
+
+command_line:
+  - binary_sensor:
+      name: Servidor en linea
+      unique_id: servidor_en_linea
+      command: /config/bin/power-ctl.sh online
+      payload_on: "on"
+      payload_off: "off"
+      device_class: connectivity
+      scan_interval: 60
+      command_timeout: 10
+  # Bajo demanda: se actualiza al arrancar, al pedir el estado y antes de apagar (no cada X minutos).
+  - sensor:
+      name: Servidor estado
+      unique_id: servidor_estado
+      command: /config/bin/power-ctl.sh status-json
+      value_template: "{{ 'ok' if value_json.playing is defined else 'sin conexion' }}"
+      json_attributes: [playing, paused, paused_min, jellyfin, plex, up]
+      scan_interval: 86400
+      command_timeout: 60
+
+template:
+  - sensor:
+      - name: Servidor reproduciendo
+        unique_id: servidor_reproduciendo
+        icon: mdi:play-circle
+        state: "{{ state_attr('sensor.servidor_estado', 'playing') | int(-1) }}"
+        availability: "{{ is_state('sensor.servidor_estado', 'ok') }}"
+      - name: Servidor en pausa
+        unique_id: servidor_en_pausa
+        icon: mdi:pause-circle
+        state: "{{ state_attr('sensor.servidor_estado', 'paused') | int(-1) }}"
+        availability: "{{ is_state('sensor.servidor_estado', 'ok') }}"
+
+script:
+  # Los avisos salen por script.aviso (packages/telegram.yaml).
+  servidor_actualizar_estado:
+    alias: Servidor - actualizar estado
+    sequence:
+      - action: homeassistant.update_entity
+        target:
+          entity_id: sensor.servidor_estado
+
+  # Apaga ya, SIN alarma de encendido: el servidor queda apagado hasta /encender o el boton.
+  # La comprobacion de reproduccion y la pregunta con botones van en /apagar (packages/telegram.yaml).
+  servidor_apagar:
+    alias: Servidor - apagar ahora
+    mode: single
+    sequence:
+      - action: shell_command.power_ctl
+        data: {orden: apagar}
+        response_variable: r
+      - variables:
+          salida: "{{ (r.stdout | default('')) ~ (r.stderr | default('')) }}"
+          estado: "{{ 'apagando' if 'APAGANDO' in salida else 'error' }}"
+      - if: "{{ estado == 'apagando' }}"
+        then:
+          - action: input_boolean.turn_on
+            target: {entity_id: input_boolean.servidor_apagado_esperado}
+          # Sin hora de encendido: se borra la anterior para que no salte "no ha arrancado".
+          - action: input_datetime.set_datetime
+            target: {entity_id: input_datetime.servidor_proximo_encendido}
+            data: {timestamp: 0}
+      - variables:
+          resultado: {estado: "{{ estado }}", salida: "{{ salida }}"}
+      - stop: Fin
+        response_variable: resultado
+
+  # Corta la corriente 5 min con el enchufe; el propio enchufe la devuelve sola (toggle_after).
+  # Solo si el servidor no responde, salvo forzar (servidor colgado, con confirmacion).
+  servidor_cortar_corriente:
+    alias: Servidor - cortar corriente 5 min
+    mode: single
+    fields:
+      forzar:
+        description: Cortar aunque el servidor responda (colgado)
+        default: false
+        selector: {boolean: null}
+    sequence:
+      - action: homeassistant.update_entity
+        target: {entity_id: binary_sensor.servidor_en_linea}
+      - if: "{{ is_state('binary_sensor.servidor_en_linea', 'on') and not (forzar | default(false) | bool) }}"
+        then:
+          - variables:
+              resultado: {estado: responde}
+          - stop: Fin
+            response_variable: resultado
+      - action: rest_command.shelly_set
+        data:
+          id: "<ID Servidor Enchufe>"
+          encender: false
+          toggle_after: 300
+        response_variable: rr
+      - variables:
+          ok: "{{ (rr.status | default(0)) == 200 }}"
+      - if: "{{ ok }}"
+        then:
+          - action: input_boolean.turn_on
+            target: {entity_id: input_boolean.servidor_apagado_esperado}
+          - action: input_datetime.set_datetime
+            target: {entity_id: input_datetime.servidor_proximo_encendido}
+            data: {timestamp: "{{ (now().timestamp() + 600) | int }}"}
+      - variables:
+          resultado: {estado: "{{ 'cortado' if ok else 'error' }}"}
+      - stop: Fin
+        response_variable: resultado
+
+automation:
+  - id: servidor_arranca
+    alias: Servidor - ha arrancado
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.servidor_en_linea
+        from: "off"
+        to: "on"
+        for: "00:01:00"
+    actions:
+      - variables:
+          esperado: "{{ is_state('input_boolean.servidor_apagado_esperado', 'on') }}"
+          prog: "{{ as_timestamp(states('input_datetime.servidor_proximo_encendido'), 0) }}"
+          dif: "{{ ((now().timestamp() - prog) / 60) | round(0) | int if prog > 0 else 0 }}"
+      - action: input_boolean.turn_off
+        target: {entity_id: input_boolean.servidor_apagado_esperado}
+      - action: script.servidor_actualizar_estado
+      - action: script.aviso
+        data:
+          titulo: "🟢 Servidor encendido"
+          mensaje: >-
+            Encendido a las {{ now().strftime('%H:%M') }}.
+            {% if esperado and prog > 0 %}Arrancó tras cortar la corriente (/encender) ✓
+            {%- else %}Encendido a mano (botón del servidor, corte de luz o reinicio).{% endif %}
+
+  - id: servidor_deja_de_responder
+    alias: Servidor - ha dejado de responder
+    mode: single
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.servidor_en_linea
+        from: "on"
+        to: "off"
+        for: "00:03:00"
+    actions:
+      - variables:
+          esperado: "{{ is_state('input_boolean.servidor_apagado_esperado', 'on') }}"
+          prog: "{{ as_timestamp(states('input_datetime.servidor_proximo_encendido'), 0) }}"
+          dias: ['lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado', 'domingo']
+          w: "{{ states('sensor.servidor_potencia') | float(-1) }}"
+      - if: "{{ esperado }}"
+        then:
+          - action: script.aviso
+            data:
+              titulo: "🔴 Servidor apagado"
+              mensaje: >-
+                {% if prog > 0 %}Corte de corriente en curso: arrancará solo en unos minutos.{% else %}Apagado correctamente. Para encenderlo: /encender (o el botón del servidor).{% endif %}
+        else:
+          - action: script.aviso
+            data:
+              titulo: "⚠️ El servidor ha dejado de responder"
+              mensaje: >-
+                No lo he apagado yo (¿apagado a mano, corte de luz o cuelgue?).
+                {% if w > 30 %}El enchufe marca {{ w | round(0) | int }} W: sigue encendido, puede estar colgado o ser un fallo de red.
+                {%- elif w >= 0 %}El enchufe marca {{ w | round(0) | int }} W: está apagado o sin corriente.
+                {%- else %}No tengo lectura del enchufe.{% endif %}
+              botones:
+                - {texto: "Cortar corriente 5 min", accion: "/cortar_corriente"}
+
+  - id: servidor_no_arranca
+    alias: Servidor - no ha arrancado a su hora
+    mode: single
+    triggers:
+      - trigger: template
+        value_template: >-
+          {%- set p = as_timestamp(states('input_datetime.servidor_proximo_encendido'), 0) -%}
+          {{ p > 0 and now().timestamp() > p + 600 }}
+    conditions:
+      - condition: state
+        entity_id: input_boolean.servidor_apagado_esperado
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.servidor_en_linea
+        state: "off"
+    actions:
+      - action: script.aviso
+        data:
+          titulo: "⚠️ El servidor no ha arrancado"
+          mensaje: >-
+            Debía encenderse a las {{ states('input_datetime.servidor_proximo_encendido')[11:16] }} y sigue sin responder.
+          botones:
+            - {texto: "Cortar corriente 5 min", accion: "/cortar_corriente"}
